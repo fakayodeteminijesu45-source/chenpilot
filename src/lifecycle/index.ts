@@ -26,6 +26,7 @@ export {
   getUserOwnedClasses,
   getCryptoErasureClasses,
   getTimeBasedRetentionClasses,
+  getActiveWorkflowProtectedClasses,
 } from "./classification";
 
 // Key Management

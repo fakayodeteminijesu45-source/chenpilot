@@ -170,6 +170,34 @@ export class RetentionEngine {
       return result.affected ?? 0;
     });
 
+    // ── intervention_record ───────────────────────────────────────────────────
+    //
+    // Temporary artifacts: pending_approval rows are live while the parent
+    // execution is active. Only purge rows where:
+    //   1. The parent execution has reached a terminal state, AND
+    //   2. The intervention itself is not pending_approval, AND
+    //   3. The record is older than the retention cutoff.
+    await runRule("intervention_record", async () => {
+      const { retentionDays } = REGISTRY.intervention_record;
+      const c = cutoff(retentionDays);
+
+      const result = await this.ds
+        .createQueryBuilder()
+        .delete()
+        .from("intervention_records")
+        .where(
+          "\"executionId\" IN (SELECT id FROM durable_execution WHERE status IN (:...done))",
+          { done: ["completed", "failed", "cancelled"] }
+        )
+        .andWhere("status NOT IN (:...live)", {
+          live: ["pending_approval"],
+        })
+        .andWhere("\"createdAt\" < :c", { c })
+        .execute();
+
+      return result.affected ?? 0;
+    });
+
     // ── conversation_memory (disk) ────────────────────────────────────────────
     await runRule("conversation_memory", async () => {
       // Purge entries for users that no longer exist in the user table.

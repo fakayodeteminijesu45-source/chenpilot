@@ -3,6 +3,10 @@ import js from "@eslint/js";
 import globals from "globals";
 import tseslint from "typescript-eslint";
 import jsdoc from "eslint-plugin-jsdoc";
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+
 export default [
   js.configs.recommended,
   ...tseslint.configs.recommended,

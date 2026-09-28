@@ -33,6 +33,7 @@ export type DataClass =
   | "queue_job"
   | "agent_execution_metrics"
   | "durable_execution"
+  | "intervention_record"
   | "webhook_idempotency"
   | "reconciliation_report"
   | "user_preferences"
@@ -61,6 +62,16 @@ export interface ClassificationRecord {
   requiresEncryption: boolean;
   /** Which DB table(s) / file path this covers */
   stores: string[];
+  /**
+   * When set, this data class must NOT be deleted while a parent workflow is
+   * in an active (non-terminal) state.  The string describes the specific
+   * protection rule so the retention engine and operators know why a time-based
+   * cutoff is insufficient on its own.
+   *
+   * Terminal states for durable_execution: completed | failed | cancelled.
+   * Retention engine must always include a status guard in its WHERE clause.
+   */
+  activeWorkflowGuard?: string;
   /** Notes for operators */
   notes?: string;
 }
@@ -200,7 +211,36 @@ export const REGISTRY: Record<DataClass, ClassificationRecord> = {
     erasureMethod: "hard-delete",
     requiresEncryption: false,
     stores: ["durable_execution", "durable_step"],
-    notes: "Completed saga state purged after 90 days.",
+    activeWorkflowGuard:
+      "DELETE must include WHERE status IN ('completed','failed','cancelled'). " +
+      "Records in pending|running|paused|awaiting_approval must never be reaped — " +
+      "durable_step rows are deleted first (FK child) before the parent execution row.",
+    notes:
+      "Terminal saga state purged after 90 days. Child steps are deleted before their " +
+      "parent execution rows to satisfy the FK RESTRICT constraint on intervention_records.",
+  },
+
+  intervention_record: {
+    dataClass: "intervention_record",
+    owner: "system",
+    purpose: "operator_audit",
+    retentionDays: 90,
+    erasureMethod: "hard-delete",
+    requiresEncryption: false,
+    stores: ["intervention_records"],
+    activeWorkflowGuard:
+      "An intervention_record row whose status is 'pending_approval' is a " +
+      "temporary artifact tied to an active durable_execution. It must not be " +
+      "deleted while the parent execution is non-terminal (pending|running|paused|" +
+      "awaiting_approval). Retention cleanup must JOIN on durable_execution.status " +
+      "IN ('completed','failed','cancelled') or check intervention_records.status " +
+      "NOT IN ('pending_approval') before purging.",
+    notes:
+      "Immutable INSERT-only audit record of every operator intervention. " +
+      "Rows in 'pending_approval' are live temporary artifacts: deleting them " +
+      "would silently discard an in-flight high-risk approval request. " +
+      "Only rows whose status is applied|rejected|failed|dry_run AND whose " +
+      "parent execution is terminal may be purged after retentionDays.",
   },
 
   webhook_idempotency: {
@@ -336,5 +376,21 @@ export function getCryptoErasureClasses(): DataClass[] {
 export function getTimeBasedRetentionClasses(): DataClass[] {
   return (Object.keys(REGISTRY) as DataClass[]).filter(
     (dc) => REGISTRY[dc].retentionDays > 0 && REGISTRY[dc].retentionDays < 9999
+  );
+}
+
+/**
+ * Returns all data classes that carry an activeWorkflowGuard.
+ *
+ * These are "temporary artifacts" whose time-based retention cutoff is a
+ * necessary but insufficient condition for deletion: the record must also
+ * belong to a terminal workflow before it may be purged.
+ *
+ * The retention engine and any future cleanup jobs MUST check this set and
+ * include the appropriate workflow-status guard in their DELETE statements.
+ */
+export function getActiveWorkflowProtectedClasses(): DataClass[] {
+  return (Object.keys(REGISTRY) as DataClass[]).filter(
+    (dc) => REGISTRY[dc].activeWorkflowGuard !== undefined
   );
 }

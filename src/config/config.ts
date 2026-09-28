@@ -33,17 +33,21 @@ const STELLAR_NETWORKS: Record<
     horizonUrl: string;
     networkPassphrase: string;
     friendbotUrl: string;
+    /** Base reserve in XLM (0.5 XLM on both testnet and public). */
+    baseReserve: number;
   }
 > = {
   testnet: {
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
     friendbotUrl: "https://friendbot.stellar.org",
+    baseReserve: 0.5,
   },
   public: {
     horizonUrl: "https://horizon.stellar.org",
     networkPassphrase: "Public Global Stellar Network ; September 2015",
     friendbotUrl: "", // No friendbot on mainnet
+    baseReserve: 0.5,
   },
 };
 
@@ -92,6 +96,9 @@ export default {
     networkPassphrase:
       process.env.STELLAR_NETWORK_PASSPHRASE || stellarConfig.networkPassphrase,
     friendbotUrl: stellarConfig.friendbotUrl,
+    baseReserve: Number.parseFloat(
+      process.env.STELLAR_BASE_RESERVE || String(stellarConfig.baseReserve)
+    ),
   },
   redis: {
     host: process.env.REDIS_HOST || "localhost",

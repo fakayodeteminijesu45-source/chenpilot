@@ -1105,11 +1105,16 @@ router.get(
         address: summary.address,
         currency: summary.currency,
         totalValue: summary.totalValue,
+        // Gross deposits vs balances the protocol lets the account withdraw (#853).
+        withdrawable: summary.withdrawable,
         assets: summary.assets.map((a) => ({
           code: a.code,
           issuer: a.issuer,
           balance: a.amount,
           value: a.valueInCurrency,
+          withdrawable: a.withdrawableAmount,
+          locked: a.lockedAmount,
+          lockedReasons: a.lockedReasons,
         })),
         fetchedAt: summary.fetchedAt,
       });

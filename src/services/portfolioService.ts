@@ -4,12 +4,23 @@
  * Fetches a user's Stellar account balances from Horizon and calculates
  * estimated net worth by pricing each asset against a target currency
  * via the Stellar DEX.
+ *
+ * Since Issue #853 the summary also separates the account's gross deposits
+ * from the balances the Stellar protocol actually lets the account withdraw
+ * (minimum reserve, open-offer liabilities and frozen trustlines are locked).
  */
 
 import * as StellarSdk from "@stellar/stellar-sdk";
 import config from "../config/config";
 import logger from "../config/logger";
 import stellarPriceService from "./stellarPrice.service";
+import {
+  aggregateWithdrawableTotals,
+  computeProtocolBalance,
+  type LockReason,
+  type ProtocolAccountContext,
+  type WithdrawableTotals,
+} from "./protocolBalances";
 
 export interface AssetBalance {
   /** Asset code, e.g. "XLM", "USDC" */
@@ -24,7 +35,20 @@ export interface AssetBalance {
   valueInCurrency: number | null;
   /** Whether this is the native XLM asset */
   isNative: boolean;
+  /** Amount the protocol currently locks (reserve, liabilities, frozen trustline) */
+  lockedAmount: number;
+  /** Amount withdrawable right now: `amount - lockedAmount` */
+  withdrawableAmount: number;
+  /** Why part of the balance is locked (`[]` when fully withdrawable) */
+  lockedReasons: LockReason[];
 }
+
+/**
+ * Separation of total deposits from the balances withdrawable right now.
+ * `totalDeposits` matches the gross `totalValue` above; `locked` is the value
+ * the protocol holds back and `withdrawable + locked === totalDeposits`.
+ */
+export type PortfolioWithdrawable = WithdrawableTotals;
 
 export interface PortfolioSummary {
   /** Stellar account address */
@@ -38,6 +62,8 @@ export interface PortfolioSummary {
    * null when no prices could be resolved at all.
    */
   totalValue: number | null;
+  /** Gross deposits vs withdrawable protocol balances (Issue #853) */
+  withdrawable: PortfolioWithdrawable;
   /** ISO timestamp of when this snapshot was taken */
   fetchedAt: string;
 }
@@ -47,6 +73,21 @@ type SupportedCurrency = (typeof SUPPORTED_CURRENCIES)[number];
 
 // Assets the price service knows how to look up (see stellarPrice.service.ts)
 const PRICEABLE_ASSETS = new Set(["XLM", "USDC", "USDT"]);
+
+/** Horizon balance line fields used by the withdrawable accounting. */
+interface HorizonBalanceFields {
+  asset_code?: string;
+  asset_issuer?: string;
+  selling_liabilities?: string;
+  is_authorized?: boolean;
+}
+
+/** Account-level fields used to derive the minimum reserve. */
+interface HorizonAccountFields {
+  subentry_count?: number;
+  num_sponsoring?: number;
+  num_sponsored?: number;
+}
 
 export class PortfolioService {
   private server: StellarSdk.Horizon.Server;
@@ -83,23 +124,50 @@ export class PortfolioService {
     const rawBalances =
       account.balances as StellarSdk.Horizon.HorizonApi.BalanceLine[];
 
-    // Build the asset list
+    // Protocol-level context: minimum-reserve derivation needs the account
+    // subentry count and sponsorship counters from Horizon.
+    const accountFields = account as unknown as HorizonAccountFields;
+    const reserveContext: ProtocolAccountContext = {
+      baseReserveXlm: config.stellar.baseReserve,
+      subentryCount: accountFields.subentry_count,
+      numSponsoring: accountFields.num_sponsoring,
+      numSponsored: accountFields.num_sponsored,
+    };
+
+    // Build the asset list, keeping the withdrawable portion separate from the
+    // gross balance it was derived from.
     const assets: AssetBalance[] = rawBalances.map((b) => {
       const isNative = b.asset_type === "native";
-      const code = isNative
-        ? "XLM"
-        : (b as StellarSdk.Horizon.HorizonApi.BalanceLineAsset).asset_code;
-      const issuer = isNative
-        ? ""
-        : (b as StellarSdk.Horizon.HorizonApi.BalanceLineAsset).asset_issuer;
+      const line = b as unknown as HorizonBalanceFields;
+      const code = isNative ? "XLM" : (line.asset_code as string);
+      const issuer = isNative ? "" : (line.asset_issuer as string);
+      const amount = parseFloat(b.balance);
+
+      const breakdown = computeProtocolBalance(
+        {
+          code,
+          issuer,
+          amount,
+          isNative,
+          sellingLiabilities:
+            line.selling_liabilities !== undefined
+              ? parseFloat(line.selling_liabilities)
+              : undefined,
+          authorized: isNative ? undefined : line.is_authorized,
+        },
+        reserveContext
+      );
 
       return {
         code,
         issuer,
         balance: b.balance,
-        amount: parseFloat(b.balance),
+        amount,
         valueInCurrency: null,
         isNative,
+        lockedAmount: breakdown.locked,
+        withdrawableAmount: breakdown.withdrawable,
+        lockedReasons: breakdown.lockedReasons,
       };
     });
 
@@ -147,11 +215,21 @@ export class PortfolioService {
         ? pricedAssets.reduce((sum, a) => sum + (a.valueInCurrency ?? 0), 0)
         : null;
 
+    // Split the priced value into withdrawable vs protocol-locked (Issue #853)
+    const withdrawable = aggregateWithdrawableTotals(
+      assets.map((asset) => ({
+        total: asset.amount,
+        withdrawable: asset.withdrawableAmount,
+        valueInCurrency: asset.valueInCurrency,
+      }))
+    );
+
     return {
       address,
       currency: normalizedCurrency,
       assets,
       totalValue,
+      withdrawable,
       fetchedAt: new Date().toISOString(),
     };
   }

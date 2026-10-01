@@ -23,6 +23,19 @@ export {
 export { EquilibreAdapter, equilibreAdapter } from "./EquilibreAdapter";
 export { YieldBloxAdapter, yieldBloxAdapter } from "./YieldBloxAdapter";
 
+// Capability advertisement revisions (Issue #855)
+export {
+  CapabilityAdvertisementManager,
+  fingerprintConfig,
+  stableStringify,
+} from "./CapabilityRevision";
+export type {
+  CapabilityAdvertisement,
+  CapabilityInvalidation,
+  CapabilityInvalidationListener,
+  CapabilityFlags,
+} from "./CapabilityRevision";
+
 // Export resilience and capability contracts
 export * from "./CapabilityContract";
 export { CircuitBreaker, CircuitState, CircuitBreakerConfig } from "./resilience/CircuitBreaker";

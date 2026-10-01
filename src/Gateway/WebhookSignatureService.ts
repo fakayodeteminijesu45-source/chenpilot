@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { Request } from "express";
-import { logger } from "../Shared/logger";
+import { logger } from "../config/logger";
 import { webhookSecretManager } from "./WebhookSecretManager";
 
 /**

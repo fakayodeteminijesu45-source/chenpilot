@@ -312,6 +312,16 @@ export const SDK_ERROR_DEFINITIONS = [
     message: "Failed to decode Soroban payload",
     description: "An XDR/ScVal payload could not be decoded.",
   },
+  {
+    code: "CONTRACT_ERROR",
+    module: M.SOROBAN,
+    category: C.SIMULATION,
+    recoverable: false,
+    message: "Contract execution failed",
+    description:
+      "A contract invocation failed with a host error. The contract's own " +
+      "#[contracterror] code is preserved in details.contractCode.",
+  },
 
   // ── Transaction utilities ────────────────────────────────────────────────────
   {
@@ -493,4 +503,122 @@ export function createSdkError(
   options?: CreateErrorOptions
 ): SdkError {
   return ErrorRegistry.createError(code, options);
+}
+
+// ─── Contract-specific failure arguments (#840) ───────────────────────────────
+
+/**
+ * The structured failure detail a contract invocation can carry.
+ *
+ * A Soroban contract that fails does so with a host error whose argument is
+ * the contract's own `#[contracterror]` discriminant — `Error(Contract, #12)`.
+ * That code is the only way to tell "insufficient balance" from "not
+ * authorized", and it is what a caller must branch on. Flattening it into a
+ * message string loses it, so it is carried as data instead.
+ */
+export interface ContractErrorDetail {
+  /** The `#[contracterror]` code the contract raised. */
+  contractCode?: number;
+  /** Host error class, e.g. `Contract`, `WasmVm`, `Storage`. */
+  errorType?: string;
+  /** The contract that raised the error, when the source reported one. */
+  contractId?: string;
+  /** VM-level reason for non-contract host errors. */
+  vmReason?: string;
+  /** The original text, kept verbatim. */
+  rawDetail?: string;
+}
+
+/**
+ * Matches the host-error forms the Soroban RPC and VM emit, e.g.
+ * `Error(Contract, #12)`, `HostError: Error(WasmVm, InvalidAction)`, and
+ * `Error(Contract, #12) <contract CABC…>`.
+ */
+const HOST_ERROR_RE =
+  /Error\(\s*(\w+)\s*,\s*(#\d+|[A-Za-z][\w ]*?)\s*\)(?:\s*<contract\s+([A-Za-z0-9]+)>)?/;
+
+/**
+ * Parse the host error class and contract-specific code out of an RPC error
+ * string.
+ *
+ * Returns undefined when the string is not a recognizable host error, so a
+ * caller can fall back to the opaque text rather than inventing a code.
+ */
+export function parseContractError(
+  detail: string
+): ContractErrorDetail | undefined {
+  if (typeof detail !== "string" || detail.length === 0) return undefined;
+
+  const match = HOST_ERROR_RE.exec(detail);
+  if (!match) return undefined;
+
+  const [, errorType, rawArg, contractId] = match;
+
+  // Only a Contract host error carries a contract-defined numeric code; any
+  // other argument is a VM-level reason string.
+  if (errorType === "Contract" && rawArg.startsWith("#")) {
+    const contractCode = Number(rawArg.slice(1));
+    if (!Number.isSafeInteger(contractCode)) return undefined;
+    return {
+      errorType,
+      contractCode,
+      ...(contractId ? { contractId } : {}),
+      rawDetail: detail,
+    };
+  }
+
+  return {
+    errorType,
+    vmReason: rawArg.trim(),
+    ...(contractId ? { contractId } : {}),
+    rawDetail: detail,
+  };
+}
+
+/**
+ * Build a `CONTRACT_ERROR` that preserves the contract's own failure code.
+ *
+ * Prefer this over `ErrorRegistry.createError("CONTRACT_ERROR", …)` so the
+ * `#[contracterror]` discriminant survives into `err.details.contractCode`
+ * and through `toJSON()`. The detail is parsed from `detail` when not given.
+ */
+export function contractError(
+  detail: string,
+  parsed?: ContractErrorDetail
+): SdkError {
+  const info = parsed ?? parseContractError(detail);
+  return ErrorRegistry.createError("CONTRACT_ERROR", {
+    message:
+      info?.contractCode !== undefined
+        ? `Contract failed: ${info.errorType} error #${info.contractCode}` +
+          (info.contractId ? ` in contract ${info.contractId}` : "")
+        : `Contract failed: ${detail}`,
+    details: { ...(info ?? {}), rawDetail: detail },
+  });
+}
+
+/**
+ * Rebuild a `CONTRACT_ERROR` from a serialized backend error, so a contract
+ * code that crossed the backend/SDK boundary is not discarded on arrival.
+ *
+ * Returns undefined when `payload` is not a contract failure, letting the
+ * caller fall back to its normal error handling.
+ */
+export function contractErrorFromJSON(payload: unknown): SdkError | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const p = payload as { code?: unknown; details?: unknown };
+  if (p.code !== "CONTRACT_ERROR") return undefined;
+
+  const details =
+    p.details && typeof p.details === "object"
+      ? ({ ...(p.details as ContractErrorDetail) } as ContractErrorDetail)
+      : undefined;
+
+  const raw =
+    details?.rawDetail ??
+    (typeof (payload as { message?: unknown }).message === "string"
+      ? ((payload as { message: string }).message satisfies string)
+      : "Unknown contract failure");
+
+  return contractError(raw, details);
 }

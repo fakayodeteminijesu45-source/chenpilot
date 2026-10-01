@@ -4,7 +4,8 @@
  * Responsible for:
  *  - Building an unsigned transaction envelope from contract call parameters
  *  - Submitting it to the RPC simulateTransaction endpoint
- *  - Returning the raw simulation result (success or error) without decoding
+ *  - Returning the raw simulation result (success, error, or restore-required)
+ *    without decoding
  *
  * This layer has no knowledge of signing, decoding, or invocation orchestration.
  */
@@ -17,6 +18,7 @@ import {
   resolveRpcUrl,
   isSimulationError,
   isSimulationSuccess,
+  isSimulationRestore,
   nativeToScVal,
   isScVal,
   SimulationSuccess,
@@ -56,6 +58,17 @@ export interface SimulationEstimates {
   footprintXdr: string;
 }
 
+/**
+ * The restore transaction a caller must submit before the simulated call can
+ * succeed for real. Present only when `restoreRequired` is true.
+ */
+export interface SimulationRestorePreamble {
+  /** Minimum resource fee for the restore transaction, in stroops */
+  minResourceFee?: string;
+  /** XDR-encoded `SorobanTransactionData` for the restore transaction */
+  transactionDataXdr?: string;
+}
+
 export interface SimulationResult {
   /** Raw simulation response from the RPC */
   raw: SimulationSuccess;
@@ -63,6 +76,16 @@ export interface SimulationResult {
   estimates?: SimulationEstimates;
   /** Auth entries required for this call */
   authEntries: unknown[];
+  /**
+   * True when the RPC executed the call only because it assumed the required
+   * ledger entries were present. Their footprint has expired, so the
+   * transaction cannot be submitted until a restore is performed first.
+   *
+   * Absent (undefined) when no restoration is needed.
+   */
+  restoreRequired?: boolean;
+  /** The restore transaction to submit first. Present iff `restoreRequired`. */
+  restorePreamble?: SimulationRestorePreamble;
   /** Invocation binding metadata */
   invocation: {
     contractId: string;
@@ -120,6 +143,11 @@ function validateSimulateParams(p: SimulateParams): void {
  *
  * Does NOT decode the return value or prepare signing data — those are
  * handled by the decoder and signingPrep layers respectively.
+ *
+ * A simulation whose footprint contains expired ledger entries is returned
+ * with `restoreRequired: true` and the `restorePreamble` to act on, rather
+ * than being reported as a plain success. The transaction must not be
+ * submitted in that state.
  */
 export async function simulate(
   params: SimulateParams
@@ -160,13 +188,13 @@ export async function simulate(
           initialDelayMs: 1000,
           maxDelayMs: 5000,
           backoffMultiplier: 2,
-        },
-      ),
+        }
+      )
     );
   } catch (err) {
     throw new SimulationError(
       `RPC simulateTransaction call failed: ${err instanceof Error ? err.message : String(err)}`,
-      err,
+      err
     );
   }
 
@@ -200,10 +228,18 @@ export async function simulate(
     ? (success.result!.auth as unknown[])
     : [];
 
+  // A restore-required response is a success that only holds "as if" the
+  // expired entries existed. Surface it structurally so a caller cannot
+  // mistake it for a submittable transaction and lose the preamble.
+  const restorePreamble = isSimulationRestore(success)
+    ? readRestorePreamble(success)
+    : undefined;
+
   return {
     raw: success,
     estimates,
     authEntries,
+    ...(restorePreamble ? { restoreRequired: true, restorePreamble } : {}),
     invocation: {
       contractId: params.contractId,
       method: params.method,
@@ -211,4 +247,43 @@ export async function simulate(
       timestamp: new Date().toISOString(),
     },
   };
+}
+
+/**
+ * Read the restore preamble off a restore-required simulation response.
+ *
+ * `transactionData` is a `SorobanDataBuilder` on the parsed response and a
+ * base64 string on the raw one; both are normalized to XDR here so callers
+ * do not have to care which shape the SDK handed back.
+ */
+function readRestorePreamble(
+  sim: SimulationSuccess
+): SimulationRestorePreamble | undefined {
+  const preamble = (sim as { restorePreamble?: unknown }).restorePreamble;
+  if (!preamble || typeof preamble !== "object") return undefined;
+
+  const p = preamble as { minResourceFee?: unknown; transactionData?: unknown };
+
+  let transactionDataXdr: string | undefined;
+  const data = p.transactionData;
+  if (typeof data === "string") {
+    transactionDataXdr = data;
+  } else if (
+    data &&
+    typeof (data as { toXDR?: unknown }).toXDR === "function"
+  ) {
+    try {
+      transactionDataXdr = (data as { toXDR: () => string }).toXDR();
+    } catch {
+      // Best-effort: a preamble we cannot serialize is still surfaced via
+      // `restoreRequired`, so the caller blocks on restore rather than
+      // submitting a doomed transaction.
+      transactionDataXdr = undefined;
+    }
+  }
+
+  const minResourceFee =
+    typeof p.minResourceFee === "string" ? p.minResourceFee : undefined;
+
+  return { minResourceFee, transactionDataXdr };
 }

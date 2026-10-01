@@ -158,4 +158,34 @@ export const slashCommandDefinitions: RESTPostAPIChatInputApplicationCommandsJSO
       .setName("discover")
       .setDescription("Discover trending Stellar assets (requires advanced role)")
       .toJSON(),
+
+    new SlashCommandBuilder()
+      .setName("price")
+      .setDescription("View price chart and historical data for an asset")
+      .addStringOption((opt: SlashCommandStringOption) =>
+        opt
+          .setName("asset")
+          .setDescription("Asset code, e.g. XLM, USDC")
+          .setRequired(true)
+      )
+      .addStringOption((opt: SlashCommandStringOption) =>
+        opt
+          .setName("currency")
+          .setDescription("Quote currency (defaults to your preferred currency)")
+          .setRequired(false)
+          .addChoices(
+            { name: "USD", value: "USD" },
+            { name: "XLM", value: "XLM" },
+            { name: "BTC", value: "BTC" }
+          )
+      )
+      .addIntegerOption((opt: SlashCommandNumberOption) =>
+        opt
+          .setName("days")
+          .setDescription("Number of days of historical data (1-90, default 7)")
+          .setRequired(false)
+          .setMinValue(1)
+          .setMaxValue(90)
+      )
+      .toJSON(),
   ];

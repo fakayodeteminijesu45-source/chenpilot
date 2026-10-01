@@ -1,7 +1,8 @@
-import { Telegraf } from 'telegraf';
+import { Telegraf, Context } from 'telegraf';
 import { TransactionNotificationData } from './types';
 import { createTrustlineOperation } from '@chen-pilot/sdk-core';
-import { getAliases } from '../commands';
+import { getAliases, SUPPORTED_CURRENCIES, SupportedCurrency } from '../commands';
+import { PriceChartService } from '../priceChart';
 
 const BACKEND_URL = process.env.NODE_URL || 'http://localhost:3000';
 
@@ -9,6 +10,8 @@ export class TelegramAdapter {
   private bot: Telegraf | undefined;
   private token: string;
   private userChatIds: Map<string, string> = new Map(); // userId -> chatId
+  // Per-user preferred report currency (USD / XLM / BTC)
+  private userCurrency: Map<string, SupportedCurrency> = new Map();
   // #145: Track last command timestamp per user
   private lastCommandTime: Map<number, number> = new Map();
   // #123: Rate limit limiters for bot commands
@@ -19,8 +22,10 @@ export class TelegramAdapter {
   private buttonHandlers: Map<string, ButtonHandler> = new Map();
   // #114: AI agent client
   private agentClient: AgentClient;
-  // Market overview service â€” used by createDigestTarget()
+  // Market overview service — used by createDigestTarget()
   private marketOverviewService: MarketOverviewService;
+  // #881: Price chart service — chart images + accessible text alternatives
+  private priceChartService: PriceChartService;
 
   constructor(token: string) {
     this.token = token;
@@ -32,6 +37,8 @@ export class TelegramAdapter {
     this.agentClient = new AgentClient({ baseUrl: BACKEND_URL });
     // Market overview service
     this.marketOverviewService = new MarketOverviewService();
+    // #881: Price chart service for chart images + accessible text summaries
+    this.priceChartService = new PriceChartService();
   }
 
   // #145: Returns true if the user is flooding (within debounce window)
@@ -123,6 +130,98 @@ export class TelegramAdapter {
         await ctx.reply(message, { parse_mode: 'HTML' });
       } catch (error) {
         await ctx.reply(`❌ Error: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
+
+    // #881: /price command — chart image + accessible text alternative
+    this.bot.command('price', async (ctx) => {
+      const userId = ctx.from?.id.toString();
+      const text = ctx.message.text.split(' ').slice(1).join(' ');
+      const args = text ? text.split(' ') : [];
+
+      if (args.length < 1) {
+        return ctx.replyWithHTML(
+          'Usage: <code>/price &lt;assetCode&gt; [currency] [days]</code>\n' +
+          'Example: <code>/price XLM USD 7</code>\n\n' +
+          `Supported currencies: ${SUPPORTED_CURRENCIES.join(', ')}\n` +
+          'Default: USD, 7 days'
+        );
+      }
+
+      const assetCode = args[0].toUpperCase();
+      const currency = (args[1]?.toUpperCase() ?? (userId ? this.userCurrency.get(userId) : undefined) ?? 'USD') as SupportedCurrency;
+      const days = parseInt(args[2] ?? '7', 10);
+
+      if (!(SUPPORTED_CURRENCIES as readonly string[]).includes(currency)) {
+        return ctx.replyWithHTML(`❌ Currency must be one of: <b>${SUPPORTED_CURRENCIES.join(', ')}</b>`);
+      }
+
+      if (isNaN(days) || days < 1 || days > 90) {
+        return ctx.reply('❌ Days must be between 1 and 90');
+      }
+
+      const statusMsg = await ctx.replyWithHTML(
+        `📊 Generating price summary for <b>${assetCode}</b> (${days} days)...`
+      );
+
+      try {
+        // Fetch historical data once — reuse for chart + text alternative
+        const priceData = await this.priceChartService.fetchHistoricalPriceData(
+          assetCode,
+          currency,
+          days
+        );
+
+        const chartBuffer = await this.priceChartService.generateChart(
+          assetCode,
+          priceData
+        );
+
+        const textSummary = this.priceChartService.generateTextSummary(
+          assetCode,
+          priceData,
+          { currency, days, platform: 'telegram' }
+        );
+
+        // Delete the "generating..." status message
+        try {
+          await ctx.deleteMessage(statusMsg.message_id);
+        } catch {
+          // ignore — some Telegram chats don't allow deleting bot msgs
+        }
+
+        // First send the text summary (accessible text alternative, stands alone)
+        await ctx.replyWithHTML(textSummary);
+
+        // Then attach the chart as a photo alongside a caption
+        try {
+          await ctx.replyWithPhoto(
+            { source: chartBuffer, filename: `${assetCode}_price_chart.png` },
+            {
+              caption: `📈 Price chart for <b>${assetCode}</b>`,
+              parse_mode: 'HTML',
+            }
+          );
+        } catch (photoError) {
+          // Fallback: send as document if photo API rejects
+          await ctx.replyWithDocument(
+            { source: chartBuffer, filename: `${assetCode}_price_chart.png` },
+            {
+              caption: `📈 Price chart for <b>${assetCode}</b>`,
+              parse_mode: 'HTML',
+            }
+          );
+        }
+      } catch (error) {
+        console.error('Telegram price command error:', error);
+        try {
+          await ctx.deleteMessage(statusMsg.message_id);
+        } catch {
+          // ignore
+        }
+        await ctx.replyWithHTML(
+          `❌ Could not generate price chart for <b>${assetCode}</b>. The asset may not be supported or the API is unavailable.`
+        );
       }
     });
 

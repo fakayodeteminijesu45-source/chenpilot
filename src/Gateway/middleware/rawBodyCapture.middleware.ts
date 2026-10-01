@@ -1,11 +1,15 @@
 import { Request, Response, NextFunction } from "express";
-import { logger } from "../../Shared/logger";
+import { logger } from "../../config/logger";
+import config from "../../config/config";
+import { budgetManager, DEFAULT_WEBHOOK_LIMIT } from "../../utils/budget";
 
 /**
- * Maximum allowed webhook payload size (1MB)
+ * Maximum allowed webhook payload size (default 1MB or configured via INBOUND_WEBHOOK_LIMIT_BYTES)
  * Prevents memory exhaustion from oversized payloads
  */
-const MAX_PAYLOAD_SIZE = 1024 * 1024; // 1MB
+function getMaxPayloadSize(): number {
+  return config.inbound?.webhookLimit || DEFAULT_WEBHOOK_LIMIT;
+}
 
 /**
  * Raw body capture middleware
@@ -33,6 +37,7 @@ export function rawBodyCapture(
     return;
   }
 
+  const maxSize = getMaxPayloadSize();
   const chunks: Buffer[] = [];
   let totalSize = 0;
 
@@ -40,17 +45,26 @@ export function rawBodyCapture(
     totalSize += chunk.length;
 
     // Reject oversized payloads early to prevent DoS
-    if (totalSize > MAX_PAYLOAD_SIZE) {
+    if (totalSize > maxSize) {
+      budgetManager.recordExhaustion(req.path, "bytes");
       logger.warn("Webhook payload exceeds maximum size", {
         path: req.path,
         totalSize,
-        maxSize: MAX_PAYLOAD_SIZE,
+        maxSize,
         ip: req.ip,
       });
 
       res.status(413).json({
         success: false,
+        status: 413,
         message: "Payload too large",
+        error: `Webhook payload exceeded size limit of ${maxSize} bytes`,
+        details: {
+          limit: maxSize,
+          actualBytes: totalSize,
+          policyType: "webhook",
+          path: req.path,
+        },
       });
 
       // Destroy the request stream
@@ -63,7 +77,24 @@ export function rawBodyCapture(
 
   req.on("end", () => {
     // Store raw body as Buffer for signature verification
-    (req as Request & { rawBody?: Buffer }).rawBody = Buffer.concat(chunks);
+    const rawBodyBuffer = Buffer.concat(chunks);
+    (req as Request & { rawBody?: Buffer }).rawBody = rawBodyBuffer;
+
+    // Parse JSON body so downstream handlers and express.json have req.body populated
+    const contentType = (req.headers["content-type"] || "").toLowerCase();
+    if (
+      contentType.includes("application/json") ||
+      req.path.includes("/webhook")
+    ) {
+      try {
+        if (rawBodyBuffer.length > 0) {
+          req.body = JSON.parse(rawBodyBuffer.toString("utf8"));
+          (req as Request & { _body?: boolean })._body = true;
+        }
+      } catch {
+        // Malformed JSON will be handled downstream by validation or auth
+      }
+    }
 
     logger.debug("Captured raw webhook body", {
       path: req.path,

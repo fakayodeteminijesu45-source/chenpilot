@@ -59,10 +59,12 @@ export class AssetCache {
     const key = this.getCacheKey(asset, dataType);
 
     // L1: Memory cache
+    // MemoryCache wraps the entry we give it in its own entry, so the
+    // AssetData sits one level further down in `.data`.
     const memoryEntry = this.memoryCache.get(key);
     if (memoryEntry && !this.isExpired(memoryEntry)) {
       memoryEntry.hits++;
-      return memoryEntry.data;
+      return (memoryEntry.data as CacheEntry).data;
     }
 
     // L2: Persistent cache

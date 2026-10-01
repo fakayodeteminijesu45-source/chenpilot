@@ -4,10 +4,14 @@
  * Fetches a user's Stellar account balances from Horizon and calculates
  * estimated net worth by pricing each asset against a target currency
  * via the Stellar DEX.
- *
+*
  * Since Issue #853 the summary also separates the account's gross deposits
  * from the balances the Stellar protocol actually lets the account withdraw
  * (minimum reserve, open-offer liabilities and frozen trustlines are locked).
+ *
+ * It also supports capital-vs-return attribution: given the external
+ * deposits/withdrawals that funded the account, it separates the current
+ * portfolio value into contributed capital and investment return.
  */
 
 import * as StellarSdk from "@stellar/stellar-sdk";
@@ -68,6 +72,67 @@ export interface PortfolioSummary {
   fetchedAt: string;
 }
 
+/**
+ * A single external capital flow into or out of a portfolio.
+ * `deposit` increases contributed capital, `withdrawal` decreases it.
+ */
+export interface CapitalFlow {
+  /** Optional stable identifier for the flow (tx hash, journal id, ...) */
+  id?: string;
+  /** Direction of the flow relative to the portfolio */
+  type: "deposit" | "withdrawal";
+  /** Positive amount, denominated in the portfolio's reporting currency */
+  amount: number;
+  /** ISO timestamp of when the flow settled */
+  occurredAt: string;
+}
+
+/** Aggregated external capital contributions for a portfolio. */
+export interface ContributedCapitalSummary {
+  /** Net contributed capital = totalDeposits − totalWithdrawals */
+  contributedCapital: number;
+  /** Gross deposits across all valid flows */
+  totalDeposits: number;
+  /** Gross withdrawals across all valid flows */
+  totalWithdrawals: number;
+  /** Number of flows that contributed to the totals */
+  flowCount: number;
+}
+
+/** Attribution of portfolio value into contributed capital and investment return. */
+export interface ReturnAttribution {
+  /** Currency the attribution is denominated in */
+  currency: string;
+  /** Current market value of the portfolio (null when it could not be priced) */
+  currentValue: number | null;
+  /** Net external capital contributed (deposits − withdrawals) */
+  contributedCapital: number;
+  /** Gross deposits */
+  totalDeposits: number;
+  /** Gross withdrawals */
+  totalWithdrawals: number;
+  /**
+   * Investment return = currentValue − contributedCapital.
+   * null when the portfolio could not be priced.
+   */
+  investmentReturn: number | null;
+  /**
+   * Investment return per unit of contributed capital.
+   * null when the portfolio is unpriced or contributedCapital <= 0.
+   */
+  returnOnCapital: number | null;
+  /** Number of valid capital flows aggregated */
+  flowCount: number;
+  /** The flows this attribution was computed from (defensive copy) */
+  flows: CapitalFlow[];
+}
+
+/** Return attribution together with the portfolio identity it describes. */
+export type PortfolioReturnAttribution = ReturnAttribution & {
+  address: string;
+  fetchedAt: string;
+};
+
 const SUPPORTED_CURRENCIES = ["USD", "XLM", "BTC"] as const;
 type SupportedCurrency = (typeof SUPPORTED_CURRENCIES)[number];
 
@@ -89,6 +154,76 @@ interface HorizonAccountFields {
   num_sponsored?: number;
 }
 
+/**
+ * Aggregate external capital flows into net contributed capital.
+ *
+ * Non-finite and negative amounts are ignored so a single malformed flow cannot
+ * silently distort attribution; ignored entries are excluded from `flowCount`.
+ */
+export function summarizeContributedCapital(
+  flows: CapitalFlow[]
+): ContributedCapitalSummary {
+  let totalDeposits = 0;
+  let totalWithdrawals = 0;
+  let flowCount = 0;
+
+  for (const flow of flows) {
+    const amount = Number(flow.amount);
+    if (!Number.isFinite(amount) || amount < 0) {
+      continue;
+    }
+
+    if (flow.type === "deposit") {
+      totalDeposits += amount;
+    } else if (flow.type === "withdrawal") {
+      totalWithdrawals += amount;
+    } else {
+      continue;
+    }
+    flowCount += 1;
+  }
+
+  return {
+    contributedCapital: totalDeposits - totalWithdrawals,
+    totalDeposits,
+    totalWithdrawals,
+    flowCount,
+  };
+}
+
+/**
+ * Split a portfolio's current value into contributed capital and the
+ * investment return generated on top of it.
+ *
+ * Reuses `summarizeContributedCapital` for the capital side and keeps the
+ * existing `totalValue: null` "unpriced" contract: when the value is unknown,
+ * the return is reported as null rather than fabricated.
+ */
+export function computeReturnAttribution(
+  currentValue: number | null,
+  flows: CapitalFlow[],
+  currency: string = "USD"
+): ReturnAttribution {
+  const capital = summarizeContributedCapital(flows);
+  const investmentReturn =
+    currentValue === null ? null : currentValue - capital.contributedCapital;
+  const returnOnCapital =
+    investmentReturn === null || capital.contributedCapital <= 0
+      ? null
+      : investmentReturn / capital.contributedCapital;
+
+  return {
+    currency: currency.toUpperCase(),
+    currentValue,
+    contributedCapital: capital.contributedCapital,
+    totalDeposits: capital.totalDeposits,
+    totalWithdrawals: capital.totalWithdrawals,
+    investmentReturn,
+    returnOnCapital,
+    flowCount: capital.flowCount,
+    flows: [...flows],
+  };
+}
 export class PortfolioService {
   private server: StellarSdk.Horizon.Server;
 
@@ -231,6 +366,33 @@ export class PortfolioService {
       totalValue,
       withdrawable,
       fetchedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Current portfolio value split into contributed capital and investment
+   * return, using the external capital flows that funded the account.
+   *
+   * Delegates valuation to `getPortfolio` so pricing, currency validation, and
+   * the `totalValue: null` "unpriced" contract stay identical to the existing
+   * public surface. This method is additive: no existing shape or export
+   * changes.
+   */
+  async getPortfolioReturnAttribution(
+    address: string,
+    flows: CapitalFlow[],
+    currency: string = "USD"
+  ): Promise<PortfolioReturnAttribution> {
+    const portfolio = await this.getPortfolio(address, currency);
+
+    return {
+      address: portfolio.address,
+      fetchedAt: portfolio.fetchedAt,
+      ...computeReturnAttribution(
+        portfolio.totalValue,
+        flows,
+        portfolio.currency
+      ),
     };
   }
 

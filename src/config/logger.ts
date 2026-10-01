@@ -201,4 +201,5 @@ export const logWarn = (message: string, meta?: Record<string, unknown>) =>
 export const logDebug = (message: string, meta?: Record<string, unknown>) =>
   logger.debug(message, meta);
 
+export { logger };
 export default logger;

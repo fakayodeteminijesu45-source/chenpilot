@@ -1,19 +1,41 @@
-import { Client, GatewayIntentBits, Message, TextChannel, Collection, Invite, GuildMember } from 'discord.js';
-import { TransactionNotificationData } from './types';
+import { Client, GatewayIntentBits, Message, TextChannel, Collection, Invite, GuildMember, Interaction, ChatInputCommandInteraction, ThreadChannel } from 'discord.js';
+import { TransactionNotificationData, PriceAlert } from './types';
 import { createTrustlineOperation } from '@chen-pilot/sdk-core';
-import { normalizeCommand } from '../commands';
+import { normalizeCommand, SUPPORTED_CURRENCIES, SupportedCurrency } from '../commands';
+import { PriceChartService } from '../priceChart';
+import { withPerformanceProfiling } from '../performanceProfiler';
+import { extractCommandName } from '../utils/commandUtils';
+import { RateLimiter, DEFAULT_RATE_LIMIT, STRICT_RATE_LIMIT } from '../rateLimiter';
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
+const HORIZON_URL = process.env.HORIZON_URL || 'https://horizon.stellar.org';
+const DEBOUNCE_MS = 2000;
+const SENSITIVE_COMMANDS = ['!trustline', '!swap', '!multisig', '!validate'];
+const SCAM_DETECTION_ENABLED = (process.env.SCAM_DETECTION_ENABLED ?? 'true') === 'true';
+const SCAM_DETECTION_CHANNELS: string[] = (process.env.SCAM_DETECTION_CHANNELS ?? '').split(',').filter(Boolean);
+const ADVANCED_ROLE_NAMES: string[] = (process.env.ADVANCED_ROLE_NAMES ?? 'admin,moderator').split(',').filter(Boolean);
 
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:2333';
-
-const BACKEND_URL = process.env.NODE_URL || 'http://localhost:3000';
+type TrendingAsset = { assetCode: string; domain?: string; priceChange24h: number; volume24h: number; holders: number };
+class AssetVerificationService { constructor(_: string) {} }
+class ScamDetectionService {}
+class AgentClient { constructor(_: { baseUrl: string }) {} }
 
 export class DiscordAdapter {
   private client: Client;
   private userChannels: Map<string, string> = new Map(); // userId -> channelId
   private token: string;
   private invites: Map<string, Collection<string, Invite>> = new Map();
+  private auditLogChannelId?: string;
+  private lastCommandTime: Map<string, number> = new Map();
+  private userCurrency: Map<string, SupportedCurrency> = new Map();
+  private priceAlerts: Map<string, PriceAlert> = new Map();
+  private verificationService: AssetVerificationService;
+  private defaultRateLimiter: RateLimiter;
+  private strictRateLimiter: RateLimiter;
+  private scamDetectionService: ScamDetectionService;
+  private marketOverviewService: any;
+  private agentClient: any;
+  private priceChartService: PriceChartService;
 
   constructor(token: string, auditLogChannelId?: string) {
     this.token = token;
@@ -36,6 +58,8 @@ export class DiscordAdapter {
     this.scamDetectionService = new ScamDetectionService();
     // #128: Initialize market overview service
     this.marketOverviewService = new MarketOverviewService();
+    // #881: Initialize price chart service for chart generation + text alternatives
+    this.priceChartService = new PriceChartService();
     // #114: Initialize AI agent client
     this.agentClient = new AgentClient({ baseUrl: BACKEND_URL });
   }
@@ -1167,29 +1191,29 @@ export class DiscordAdapter {
           await message.reply(`📊 Generating price chart for **${assetCode}** (${days} days)...`);
 
           try {
-            // Fetch current price and price change
-            const currentPrice = await this.priceChartService.getCurrentPrice(assetCode, currency);
-            const priceChange = await this.priceChartService.getPriceChange(assetCode, currency, 24);
-
-            // Generate the chart
-            const chartBuffer = await this.priceChartService.generatePriceChart(
+            // Fetch historical data once — used for both chart image and text alternative
+            const priceData = await this.priceChartService.fetchHistoricalPriceData(
               assetCode,
               currency,
               days
             );
 
-            // Create message with chart and price info
-            const changeEmoji = priceChange >= 0 ? '📈' : '📉';
-            const changeText = priceChange >= 0 ? `+${priceChange.toFixed(2)}%` : `${priceChange.toFixed(2)}%`;
+            // Generate the chart image
+            const chartBuffer = await this.priceChartService.generateChart(
+              assetCode,
+              priceData
+            );
 
-            let reply = `${changeEmoji} **${assetCode} Price Chart**\n\n`;
-            reply += `**Current Price:** ${currentPrice.toFixed(6)} ${currency}\n`;
-            reply += `**24h Change:** ${changeText}\n`;
-            reply += `**Period:** Last ${days} days\n\n`;
+            // Generate comprehensive text alternative (accessible summary of chart data)
+            const textSummary = this.priceChartService.generateTextSummary(
+              assetCode,
+              priceData,
+              { currency, days, platform: 'discord' }
+            );
 
-            // Send the chart as an attachment
+            // Send the text summary + chart attachment (text supplements the image, stands alone for accessibility)
             await message.reply({
-              content: reply,
+              content: textSummary,
               files: [{
                 attachment: chartBuffer,
                 name: `${assetCode}_price_chart.png`
@@ -1447,6 +1471,469 @@ export class DiscordAdapter {
       }
     } catch (error) {
       console.error("❌ Error logging referral to backend:", error);
+    }
+  }
+
+  /**
+   * Route chat-input (/) slash commands to their handlers.
+   * Mirrors the behavior of the legacy `!` prefix commands where applicable.
+   * Referenced by the `interactionCreate` handler at startup.
+   */
+  private async handleSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const userId = interaction.user.id;
+    const commandName = interaction.commandName;
+
+    // Defer reply so longer-running commands (price chart, AI help) don't hit the 3s timeout
+    await interaction.deferReply();
+
+    try {
+      switch (commandName) {
+        case 'start': {
+          await interaction.editReply(
+            'Welcome to Chen Pilot! I am your AI-powered Stellar DeFi assistant.'
+          );
+          return;
+        }
+
+        case 'ping': {
+          const startTime = Date.now();
+          try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+            const response = await fetch(`${BACKEND_URL}/api/health`, {
+              method: 'GET',
+              signal: controller.signal,
+            });
+            clearTimeout(timeout);
+            const roundtripMs = Date.now() - startTime;
+            const backendStatus = response.ok
+              ? 'Online'
+              : `Returned HTTP ${response.status}`;
+            await interaction.editReply(
+              `🏓 **Pong!**\n\n📡 **End-to-End Latency:** ${roundtripMs}ms\n✅ Backend: ${backendStatus}`
+            );
+          } catch {
+            const roundtripMs = Date.now() - startTime;
+            await interaction.editReply(
+              `🏓 **Pong!**\n\n📡 **End-to-End Latency:** ${roundtripMs}ms\n❌ Backend: Unreachable`
+            );
+          }
+          return;
+        }
+
+        case 'help': {
+          const query = interaction.options.getString('query') ?? '';
+          const results = searchFeatures(query);
+          const isSearch = query.length > 0;
+          await interaction.editReply(
+            formatHelpMessage(results, isSearch, 'markdown')
+          );
+          return;
+        }
+
+        case 'thread': {
+          const channel = interaction.channel;
+          if (channel && channel.type === ChannelType.GuildText) {
+            try {
+              const thread = await channel.threads.create({
+                name: `Chen Pilot Session - ${interaction.user.username}`,
+                autoArchiveDuration: 60,
+                startMessage: undefined,
+              });
+              await interaction.editReply(
+                `👋 Hello ${interaction.user.username}! I've started a dedicated thread to keep our conversation organized.`
+              );
+              await thread.send(
+                `👋 Hello ${interaction.user.username}! How can I help you with Stellar DeFi today?`
+              );
+            } catch (error) {
+              console.error('Error creating thread via slash command:', error);
+              await interaction.editReply(
+                "❌ I couldn't start a thread. Please make sure I have the 'Create Public Threads' permission."
+              );
+            }
+          } else if (channel?.isThread?.()) {
+            await interaction.editReply(
+              "🧵 We are already in a thread! I'm ready to assist you here."
+            );
+          } else {
+            await interaction.editReply(
+              '❌ Threads can only be started in text channels.'
+            );
+          }
+          return;
+        }
+
+        case 'sponsor': {
+          await interaction.editReply('⏳ Requesting account sponsorship...');
+          try {
+            const response = await fetch(
+              `${BACKEND_URL}/api/account/${userId}/sponsor`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+              }
+            );
+            const data = (await response.json()) as {
+              success: boolean;
+              message: string;
+              address?: string;
+            };
+
+            if (data.success) {
+              await interaction.editReply(
+                `✅ Account sponsored successfully!\n📬 Address: \`${data.address}\``
+              );
+              await this.logAuditAction({
+                action: 'SPONSOR_ACCOUNT',
+                triggeredBy: userId,
+                details: `Address: ${data.address}`,
+                success: true,
+                timestamp: new Date().toISOString(),
+              });
+            } else {
+              await interaction.editReply(
+                `❌ Sponsorship failed: ${data.message}`
+              );
+            }
+          } catch {
+            await interaction.editReply(
+              '❌ Could not reach the sponsorship service. Please try again later.'
+            );
+          }
+          return;
+        }
+
+        case 'trustline': {
+          const assetCode = interaction.options.getString('asset', true).toUpperCase();
+          const assetIssuer = interaction.options.getString('issuer', true);
+
+          await interaction.editReply(
+            `🔍 Looking up asset **${assetCode}** from **${assetIssuer}**...`
+          );
+
+          try {
+            const op = await createTrustlineOperation(assetCode, assetIssuer);
+            const reply =
+              `✅ Found asset **${assetCode}**!\n\n` +
+              `To add this trustline, use the following details in your wallet:\n` +
+              `**Asset:** ${assetCode}\n` +
+              `**Issuer:** \`${(op as { asset: { issuer: string } }).asset.issuer}\``;
+            await interaction.editReply(reply);
+            await this.logAuditAction({
+              action: 'TRUSTLINE_LOOKUP',
+              triggeredBy: userId,
+              details: `Asset: ${assetCode}, Issuer: ${assetIssuer}`,
+              success: true,
+              timestamp: new Date().toISOString(),
+            });
+          } catch (error) {
+            await interaction.editReply(
+              `❌ Error: ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+          return;
+        }
+
+        case 'dashboard': {
+          await interaction.editReply(
+            `📊 **Chen Pilot Dashboard**\n\nAccess your admin dashboard here:\n🔗 ${DASHBOARD_URL}\n\n*Note: You must be logged in to view the dashboard.*`
+          );
+          return;
+        }
+
+        case 'validate': {
+          const assetCode = interaction.options.getString('asset', true).toUpperCase();
+          const issuerAddress = interaction.options.getString('issuer', true);
+
+          await interaction.editReply(
+            `🔍 Verifying asset **${assetCode}** from issuer \`${issuerAddress.slice(0, 8)}...\``
+          );
+
+          try {
+            const result = await this.verificationService.verifyAsset(
+              assetCode,
+              issuerAddress
+            );
+            const statusEmoji =
+              result.status === 'VERIFIED'
+                ? '✅'
+                : result.status === 'MALICIOUS'
+                  ? '🚨'
+                  : '⚠️';
+
+            let reply = `${statusEmoji} **Asset Verification: ${result.status}**\n\n`;
+            reply += `**Asset:** ${assetCode}\n`;
+            reply += `**Issuer:** \`${issuerAddress}\`\n`;
+            if (result.domain) reply += `**Domain:** ${result.domain}\n`;
+            if (result.details) reply += `**Details:** ${result.details}\n`;
+            reply += `\n**Safe to use:** ${result.isSafe ? 'Yes ✅' : 'No ❌'}`;
+
+            await interaction.editReply(reply);
+          } catch (error) {
+            await interaction.editReply(
+              `❌ Verification error: ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+          return;
+        }
+
+        case 'multisig': {
+          if (!isDM(interaction.channel ?? undefined)) {
+            await interaction.editReply(
+              '🔒 This command must be used in a Direct Message for security. Please DM me instead.'
+            );
+            return;
+          }
+          const response = await botWorkflowManager.startWorkflow(
+            userId,
+            'discord',
+            'multisig_wizard'
+          );
+          await interaction.editReply(response.message);
+          return;
+        }
+
+        case 'currency': {
+          const arg = interaction.options.getString('currency', true).toUpperCase();
+          if (
+            !(SUPPORTED_CURRENCIES as readonly string[]).includes(arg)
+          ) {
+            await interaction.editReply(
+              `❌ Currency must be one of: ${SUPPORTED_CURRENCIES.join(', ')}\nCurrent: **${this.userCurrency.get(userId) ?? 'USD'}**`
+            );
+            return;
+          }
+          this.userCurrency.set(
+            userId,
+            arg as (typeof SUPPORTED_CURRENCIES)[number]
+          );
+          await interaction.editReply(`✅ Report currency set to **${arg}**`);
+          return;
+        }
+
+        case 'report': {
+          const currency = this.userCurrency.get(userId) ?? 'USD';
+          await interaction.editReply(
+            `⏳ Fetching portfolio report in **${currency}**...`
+          );
+          try {
+            const res = await fetch(
+              `${BACKEND_URL}/api/portfolio/${userId}?currency=${currency}`
+            );
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = (await res.json()) as {
+              totalValue: number;
+              assets: { code: string; balance: number; value: number }[];
+            };
+            let reply = `📊 **Portfolio Report (${currency})**\n\n`;
+            reply += `**Total Value:** ${data.totalValue.toFixed(4)} ${currency}\n\n`;
+            for (const a of data.assets) {
+              reply += `• **${a.code}**: ${a.balance} ≈ ${a.value.toFixed(4)} ${currency}\n`;
+            }
+            await interaction.editReply(reply);
+          } catch {
+            await interaction.editReply(
+              '❌ Could not fetch portfolio. Make sure your account is registered.'
+            );
+          }
+          return;
+        }
+
+        case 'alert': {
+          const assetCode = interaction.options.getString('asset', true).toUpperCase();
+          const condition = interaction.options.getString('condition', true) as 'above' | 'below';
+          const targetPrice = interaction.options.getNumber('price', true);
+          const currencyOpt = interaction.options.getString('currency');
+          const currency =
+            (currencyOpt?.toUpperCase() as 'USD' | 'XLM' | 'BTC' | undefined) ??
+            this.userCurrency.get(userId) ??
+            'USD';
+
+          if (condition !== 'above' && condition !== 'below') {
+            await interaction.editReply('❌ Condition must be `above` or `below`.');
+            return;
+          }
+          if (targetPrice <= 0) {
+            await interaction.editReply('❌ Price must be a positive number.');
+            return;
+          }
+          if (!(SUPPORTED_CURRENCIES as readonly string[]).includes(currency)) {
+            await interaction.editReply(
+              `❌ Currency must be one of: ${SUPPORTED_CURRENCIES.join(', ')}`
+            );
+            return;
+          }
+
+          const alertId = `${userId}-${assetCode}-${Date.now()}`;
+          const alert: PriceAlert = {
+            id: alertId,
+            userId,
+            assetCode,
+            targetPrice,
+            currency,
+            condition,
+            createdAt: new Date().toISOString(),
+            triggered: false,
+          };
+          this.priceAlerts.set(alertId, alert);
+          const channelId = (interaction.channel as { id?: string })?.id;
+          if (channelId && !this.userChannels.has(userId)) {
+            this.userChannels.set(userId, channelId);
+          }
+          await interaction.editReply(
+            `🔔 Alert set: notify me when **${assetCode}** is ${condition} **${targetPrice} ${currency}**`
+          );
+          return;
+        }
+
+        case 'alerts': {
+          const userAlerts = [...this.priceAlerts.values()].filter(
+            (a) => a.userId === userId && !a.triggered
+          );
+          if (userAlerts.length === 0) {
+            await interaction.editReply(
+              '📭 You have no active price alerts. Use `/alert` to set one.'
+            );
+            return;
+          }
+          let reply = `🔔 **Your Active Alerts**\n\n`;
+          for (const a of userAlerts) {
+            reply += `• **${a.assetCode}** ${a.condition} ${a.targetPrice} ${a.currency} (ID: \`${a.id.slice(-6)}\`)\n`;
+          }
+          await interaction.editReply(reply);
+          return;
+        }
+
+        case 'advanced': {
+          if (!this.hasAdvancedRole({ member: interaction.member as any, guild: interaction.guild as any })) {
+            await interaction.editReply(
+              `🔒 This command requires one of the following roles: **${ADVANCED_ROLE_NAMES.join(', ')}**`
+            );
+            return;
+          }
+          await interaction.editReply(
+            '✅ Advanced command executed. (Role check passed)'
+          );
+          return;
+        }
+
+        case 'discover': {
+          if (!this.hasAdvancedRole({ member: interaction.member as any, guild: interaction.guild as any })) {
+            await interaction.editReply(
+              `🔒 \`/discover\` requires one of the following roles: **${ADVANCED_ROLE_NAMES.join(', ')}**`
+            );
+            return;
+          }
+          await interaction.editReply('🔍 Discovering trending Stellar assets...');
+          try {
+            const res = await fetch(`${BACKEND_URL}/api/assets/trending`);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const assets = (await res.json()) as TrendingAsset[];
+            if (!assets.length) {
+              await interaction.editReply('📭 No trending assets found at this time.');
+              return;
+            }
+            let reply = `🌟 **Trending Stellar Assets**\n\n`;
+            for (const a of assets.slice(0, 5)) {
+              const change =
+                a.priceChange24h >= 0
+                  ? `+${a.priceChange24h.toFixed(2)}%`
+                  : `${a.priceChange24h.toFixed(2)}%`;
+              const emoji = a.priceChange24h >= 0 ? '📈' : '📉';
+              reply += `${emoji} **${a.assetCode}**${a.domain ? ` (${a.domain})` : ''}\n`;
+              reply += `  24h Change: ${change} | Volume: ${a.volume24h.toLocaleString()} | Holders: ${a.holders.toLocaleString()}\n\n`;
+            }
+            await interaction.editReply(reply);
+          } catch {
+            await interaction.editReply(
+              '❌ Could not fetch trending assets. Please try again later.'
+            );
+          }
+          return;
+        }
+
+        case 'price': {
+          // #881: /price slash command — chart + accessible text alternative
+          const assetCode = interaction.options.getString('asset', true).toUpperCase();
+          const currencyOpt = interaction.options.getString('currency');
+          const daysOpt = interaction.options.getInteger('days');
+          const currency =
+            (currencyOpt?.toUpperCase() as 'USD' | 'XLM' | 'BTC' | undefined) ??
+            this.userCurrency.get(userId) ??
+            'USD';
+          const days = daysOpt ?? 7;
+
+          if (!(SUPPORTED_CURRENCIES as readonly string[]).includes(currency)) {
+            await interaction.editReply(
+              `❌ Currency must be one of: ${SUPPORTED_CURRENCIES.join(', ')}`
+            );
+            return;
+          }
+          if (days < 1 || days > 90) {
+            await interaction.editReply('❌ Days must be between 1 and 90');
+            return;
+          }
+
+          await interaction.editReply(
+            `📊 Generating price summary for **${assetCode}** (${days} days)...`
+          );
+
+          try {
+            // Fetch data once, reuse for image + text alternative
+            const priceData = await this.priceChartService.fetchHistoricalPriceData(
+              assetCode,
+              currency,
+              days
+            );
+            const chartBuffer = await this.priceChartService.generateChart(
+              assetCode,
+              priceData
+            );
+            const textSummary = this.priceChartService.generateTextSummary(
+              assetCode,
+              priceData,
+              { currency, days, platform: 'discord' }
+            );
+
+            // Use followUp with files since editReply files support is limited on some Discord API versions
+            await interaction.editReply(textSummary);
+            if (interaction.channel?.isTextBased()) {
+              await interaction.followUp({
+                content: `📈 Chart for **${assetCode}**:`,
+                files: [
+                  {
+                    attachment: chartBuffer,
+                    name: `${assetCode}_price_chart.png`,
+                  },
+                ],
+              });
+            }
+          } catch (error) {
+            console.error('Price slash command error:', error);
+            await interaction.editReply(
+              `❌ Could not generate price chart for **${assetCode}**. The asset may not be supported or the API is unavailable.`
+            );
+          }
+          return;
+        }
+
+        default: {
+          await interaction.editReply(
+            `⚠️ Command \`/${commandName}\` is not yet implemented.`
+          );
+          return;
+        }
+      }
+    } catch (handlerError) {
+      console.error(`Unhandled error in /${commandName} slash command:`, handlerError);
+      try {
+        if (interaction.deferred && !interaction.replied) {
+          await interaction.editReply('❌ An error occurred while processing your command.');
+        }
+      } catch {
+        // swallow secondary reply error
+      }
     }
   }
 }

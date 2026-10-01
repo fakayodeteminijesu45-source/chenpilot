@@ -149,7 +149,7 @@ export default {
           .filter(Boolean)
       : [],
   },
-externalRequest: {
+  externalRequest: {
     defaultBudget: {
       deadlineMs: parsePositiveInt("EXTERNAL_REQUEST_DEADLINE_MS", "10000"),
       attempts: Number.parseInt(process.env.EXTERNAL_REQUEST_ATTEMPTS || "3", 10),
@@ -159,6 +159,11 @@ externalRequest: {
         10
       ),
     },
+  },
+  inbound: {
+    jsonLimit: Number.parseInt(process.env.INBOUND_JSON_LIMIT_BYTES || "1048576", 10),
+    webhookLimit: Number.parseInt(process.env.INBOUND_WEBHOOK_LIMIT_BYTES || "1048576", 10),
+    attachmentLimit: Number.parseInt(process.env.INBOUND_ATTACHMENT_LIMIT_BYTES || "26214400", 10),
   },
   models: {
     primary: process.env.MODEL_PRIMARY || "claude-3-5-haiku-20241022",

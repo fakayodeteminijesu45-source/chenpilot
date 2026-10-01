@@ -207,7 +207,7 @@ export class BudgetManager {
     }
   }
 
-  private recordExhaustion(path: string, resource: BudgetResource): void {
+  recordExhaustion(path: string, resource: BudgetResource): void {
     const current = this.metrics.get(path) || {
       exhausted: { deadline: 0, attempts: 0, bytes: 0, downstreamCalls: 0 },
       total: 0,
@@ -226,6 +226,132 @@ export class BudgetManager {
 }
 
 export const budgetManager = BudgetManager.getInstance();
+
+/**
+ * Inbound payload size policy defaults (in bytes)
+ */
+export const DEFAULT_INBOUND_JSON_LIMIT = 1024 * 1024; // 1MB
+export const DEFAULT_WEBHOOK_LIMIT = 1024 * 1024; // 1MB
+export const DEFAULT_ATTACHMENT_LIMIT = 25 * 1024 * 1024; // 25MB
+
+export type InboundPolicyType = "json" | "webhook" | "attachment" | "custom";
+
+export interface InboundPolicyConfig {
+  jsonLimit?: number;
+  webhookLimit?: number;
+  attachmentLimit?: number;
+  endpointGaps?: Record<string, number>;
+  attachmentPaths?: string[];
+  webhookPaths?: string[];
+}
+
+export interface InboundBudgetCheck {
+  allowed: boolean;
+  limit: number;
+  actualBytes: number;
+  policyType: InboundPolicyType;
+}
+
+/**
+ * Resolves the applicable byte limit and policy type for a given request path
+ */
+export function resolveInboundLimit(
+  path: string,
+  options?: InboundPolicyConfig
+): { limit: number; policyType: InboundPolicyType } {
+  const jsonLimit = options?.jsonLimit ?? DEFAULT_INBOUND_JSON_LIMIT;
+  const webhookLimit = options?.webhookLimit ?? DEFAULT_WEBHOOK_LIMIT;
+  const attachmentLimit = options?.attachmentLimit ?? DEFAULT_ATTACHMENT_LIMIT;
+
+  // 1. Endpoint-specific gaps (exact or prefix match)
+  if (options?.endpointGaps) {
+    if (options.endpointGaps[path] !== undefined) {
+      return { limit: options.endpointGaps[path], policyType: "custom" };
+    }
+    for (const [gapPath, customLimit] of Object.entries(options.endpointGaps)) {
+      if (path.startsWith(gapPath)) {
+        return { limit: customLimit, policyType: "custom" };
+      }
+    }
+  }
+
+  // 2. Webhook endpoints
+  const isWebhook =
+    path.includes("/webhook") ||
+    Boolean(options?.webhookPaths?.some((p) => path.startsWith(p)));
+  if (isWebhook) {
+    return { limit: webhookLimit, policyType: "webhook" };
+  }
+
+  // 3. Attachment endpoints (e.g. export, upload, media, audio, etc.)
+  const defaultAttachmentPrefixes = ["/export", "/attachments", "/upload", "/media", "/voice"];
+  const isAttachment =
+    defaultAttachmentPrefixes.some((prefix) => path.includes(prefix)) ||
+    Boolean(options?.attachmentPaths?.some((p) => path.startsWith(p)));
+  if (isAttachment) {
+    return { limit: attachmentLimit, policyType: "attachment" };
+  }
+
+  // 4. Default standard JSON
+  return { limit: jsonLimit, policyType: "json" };
+}
+
+/**
+ * Evaluates whether an inbound request of `bytes` size is within policy for `path`.
+ * If exceeded, records exhaustion on `budgetManager`.
+ */
+export function checkInboundBudget(
+  path: string,
+  bytes: number,
+  options?: InboundPolicyConfig
+): InboundBudgetCheck {
+  const { limit, policyType } = resolveInboundLimit(path, options);
+
+  if (bytes > limit) {
+    budgetManager.recordExhaustion(path, "bytes");
+    return {
+      allowed: false,
+      limit,
+      actualBytes: bytes,
+      policyType,
+    };
+  }
+
+  return {
+    allowed: true,
+    limit,
+    actualBytes: bytes,
+    policyType,
+  };
+}
+
+/**
+ * Enforces inbound budget for a path, throwing BudgetExhaustedError if violated.
+ */
+export function enforceInboundBudget(
+  path: string,
+  bytes: number,
+  options?: InboundPolicyConfig
+): void {
+  const check = checkInboundBudget(path, bytes, options);
+  if (!check.allowed) {
+    const syntheticBudget: RequestBudget = {
+      deadline: Date.now(),
+      attempts: 1,
+      bytes: check.limit,
+      downstreamCalls: 0,
+      path,
+      consumedAttempts: 1,
+      consumedBytes: bytes,
+      consumedDownstreamCalls: 0,
+    };
+    throw new BudgetExhaustedError(
+      `Inbound ${check.policyType} payload exceeded byte limit for ${path}: ${bytes}/${check.limit}`,
+      "bytes",
+      syntheticBudget
+    );
+  }
+}
 
 export function createBudget(options: BudgetOptions): RequestBudget {
   return budgetManager.createRootBudget(options);

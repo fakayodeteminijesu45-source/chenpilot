@@ -2,7 +2,7 @@ import crypto from "crypto";
 import { Repository, LessThan } from "typeorm";
 import AppDataSource from "../config/Datasource";
 import { WebhookIdempotency } from "./webhookIdempotency.entity";
-import { logger } from "../Shared/logger";
+import { logger } from "../config/logger";
 import { VerificationResult } from "./WebhookSignatureService";
 
 /**

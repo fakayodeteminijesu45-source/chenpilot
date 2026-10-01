@@ -10,17 +10,21 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "telegraf": "^4.16.3",
+    "@chen-pilot/sdk-core": "workspace:*",
+    "axios": "^1.7.2",
+    "chartjs-node-canvas": "^4.1.6",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",
-    "axios": "^1.7.2",
     "stellar-sdk": "^13.0.0",
-    "@chen-pilot/sdk-core": "workspace:*",
-    "chartjs-node-canvas": "^4.1.6"
+    "telegraf": "^4.16.3"
   },
   "devDependencies": {
-    "typescript": "^5.7.3",
+    "@jest/globals": "^30.5.2",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.12.7",
+    "jest": "^30.5.2",
+    "ts-jest": "^29.4.14",
     "ts-node": "^10.9.2",
-    "@types/node": "^20.12.7"
+    "typescript": "^5.7.3"
   }
 }

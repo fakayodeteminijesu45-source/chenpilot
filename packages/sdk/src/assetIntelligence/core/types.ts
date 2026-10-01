@@ -12,6 +12,7 @@ export interface Asset {
 
 export interface AssetData {
   metadata?: AssetMetadata;
+  metadataRevisionId?: string;
   price?: PriceInfo;
   trust?: TrustScore;
   compatibility?: CompatibilityMap;
@@ -27,6 +28,13 @@ export interface AssetMetadata {
   isAuthRequired?: boolean;
   authRevoked?: boolean;
   tomlUrl?: string;
+}
+
+export interface MetadataRevision {
+  revisionId: string; // content hash of asset + metadata
+  asset: Asset;
+  metadata: AssetMetadata;
+  recordedAt: number;
 }
 
 export interface PriceInfo {

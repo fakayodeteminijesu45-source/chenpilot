@@ -5,6 +5,18 @@ import {
 } from "../../../config/defiAdapters";
 import { resilienceEngine } from "./resilience/ResilienceEngine";
 import { createBudget, budgetedFetch, BudgetExhaustedError, type RequestBudget } from "../../../utils/budget";
+import {
+  CircuitBreaker,
+  type CircuitBreakerOptions,
+  type RetryOptions,
+} from "../../../utils/resilience";
+import {
+  CapabilityAdvertisementManager,
+  fingerprintConfig,
+  type CapabilityAdvertisement,
+  type CapabilityInvalidation,
+  type CapabilityInvalidationListener,
+} from "./CapabilityRevision";
 import { z } from "zod";
 
 /**
@@ -69,6 +81,16 @@ export interface TransactionRequest {
  */
 export abstract class DeFiAdapter {
   protected config: DeFiAdapterConfig;
+  protected circuitBreaker: CircuitBreaker;
+  protected retryOptions: RetryOptions;
+
+  /**
+   * Capability advertisement derived from the current configuration. The
+   * advertisement is invalidated whenever the configuration changes so a stale
+   * capability set can never be served (Issue #855).
+   */
+  private readonly capabilityAdvertisements =
+    new CapabilityAdvertisementManager<AdapterCapabilities>();
 
   constructor(protocol: "equilibre" | "yieldblox") {
     this.config = getAdapterConfig(protocol);
@@ -102,10 +124,88 @@ export abstract class DeFiAdapter {
   }
 
   /**
-   * Check if a specific capability is enabled
+   * Fingerprint of the configuration the capability advertisement belongs to.
+   */
+  protected capabilityConfigFingerprint(): string {
+    return fingerprintConfig(this.config);
+  }
+
+  /**
+   * The advertised capabilities for the current configuration. When the
+   * configuration changed since the last advertisement, the previous one is
+   * invalidated (revision bumped, listeners notified) and re-derived.
+   */
+  getCapabilityAdvertisement(): CapabilityAdvertisement<AdapterCapabilities> {
+    return this.capabilityAdvertisements.get(
+      this.capabilityConfigFingerprint(),
+      () => this.config.capabilities
+    );
+  }
+
+  /**
+   * Check if a specific capability is enabled. Reads from the current
+   * advertisement, so a configuration change is reflected immediately and the
+   * stale advertisement is invalidated first.
    */
   hasCapability(capability: keyof AdapterCapabilities): boolean {
-    return this.config.capabilities[capability];
+    return this.getCapabilityAdvertisement().capabilities[capability];
+  }
+
+  /**
+   * Current capability revision. Advances every time an advertisement is
+   * invalidated, letting consumers detect that an advertisement they hold is
+   * stale.
+   */
+  getCapabilityRevision(): number {
+    return this.capabilityAdvertisements.getRevision();
+  }
+
+  /**
+   * True when a live capability advertisement matches the current
+   * configuration. Returns false once the advertisement was invalidated.
+   */
+  hasValidCapabilityAdvertisement(): boolean {
+    const advertisement = this.capabilityAdvertisements.peek();
+    return (
+      advertisement !== null &&
+      advertisement.configFingerprint === this.capabilityConfigFingerprint()
+    );
+  }
+
+  /**
+   * Replace the adapter configuration and invalidate the previously advertised
+   * capabilities. Intentional API change introduced for Issue #855: adapters
+   * that mutate their configuration at runtime must go through this method (or
+   * {@link updateConfig}) so consumers never see a stale capability set.
+   */
+  applyConfig(config: DeFiAdapterConfig, reason = "config-change"): void {
+    this.config = config;
+    this.capabilityAdvertisements.invalidate(reason);
+  }
+
+  /**
+   * Merge a partial configuration change and invalidate the previously
+   * advertised capabilities.
+   */
+  updateConfig(patch: Partial<DeFiAdapterConfig>, reason = "config-change"): void {
+    this.applyConfig({ ...this.config, ...patch }, reason);
+  }
+
+  /**
+   * Explicitly drop the live capability advertisement without changing the
+   * configuration, e.g. after an out-of-band change.
+   */
+  invalidateCapabilities(reason = "manual"): CapabilityInvalidation<AdapterCapabilities> {
+    return this.capabilityAdvertisements.invalidate(reason);
+  }
+
+  /**
+   * Observe capability invalidations. Returns an unsubscribe function.
+   */
+  onCapabilitiesInvalidated(
+    listener: CapabilityInvalidationListener<AdapterCapabilities>
+  ): () => void {
+    return this.capabilityAdvertisements.onInvalidate(listener);
   }
 
   /**

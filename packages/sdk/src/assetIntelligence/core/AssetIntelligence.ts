@@ -5,6 +5,7 @@
 
 import { AssetCache } from './AssetCache.js';
 import { CacheInvalidator } from './CacheInvalidator.js';
+import { MetadataRevisionStore } from './MetadataRevisionStore.js';
 import { TrustScorer } from '../trust/TrustScorer.js';
 import { TrustSignals } from '../trust/TrustSignals.js';
 import { TrustRegistry } from '../trust/TrustRegistry.js';
@@ -22,6 +23,7 @@ import {
   AssetEvent,
   AssetIntelligenceError,
   ErrorCode,
+  MetadataRevision,
 } from './types.js';
 
 export class AssetIntelligence {
@@ -33,10 +35,15 @@ export class AssetIntelligence {
   private assetValidator: AssetValidator;
   private networkCompatibility: NetworkCompatibility;
   private versionCompatibility: VersionCompatibility;
+  private metadataRevisions: MetadataRevisionStore;
   private config: AssetIntelligenceConfig;
 
   constructor(config: AssetIntelligenceConfig) {
     this.config = config;
+
+    // Initialize metadata revision store (kept separate from the cache so
+    // invalidation and TTL expiry never remove historical revisions)
+    this.metadataRevisions = new MetadataRevisionStore();
     
     // Initialize cache
     this.cache = new AssetCache(config.cache);
@@ -86,6 +93,9 @@ export class AssetIntelligence {
 
       // Fetch metadata
       const metadata = await this.fetchMetadata(asset);
+
+      // Record the metadata revision so historical records can refer to it
+      const revision = this.metadataRevisions.record(asset, metadata);
       
       // Fetch trust score
       const trust = await this.trustScorer.calculateTrustScore(asset);
@@ -97,6 +107,7 @@ export class AssetIntelligence {
 
       const assetData: AssetData = {
         metadata,
+        metadataRevisionId: revision.revisionId,
         trust,
         compatibility: {
           [asset.network]: compatibility,
@@ -231,6 +242,21 @@ export class AssetIntelligence {
         asset
       );
     }
+  }
+
+  /**
+   * Get the exact metadata revision a historical record was built from.
+   * Revisions are kept when the cache is invalidated, refreshed or cleared.
+   */
+  getMetadataRevision(revisionId: string): MetadataRevision | undefined {
+    return this.metadataRevisions.get(revisionId);
+  }
+
+  /**
+   * Get all recorded metadata revisions for an asset, oldest first.
+   */
+  getMetadataHistory(asset: Asset): MetadataRevision[] {
+    return this.metadataRevisions.getHistory(asset);
   }
 
   /**

@@ -5,7 +5,8 @@ import {
   resilienceEngine,
   QuoteResultSchema,
   PositionResultSchema,
-  EquilibreSwapQuoteResponseSchema
+  EquilibreSwapQuoteResponseSchema,
+  EquilibreAdapter
 } from "../../src/Agents/tools/defi";
 import { z } from "zod";
 
@@ -262,6 +263,115 @@ describe("DeFi Integration Resilience Layer", () => {
 
       // Attempt 3: rejected by circuit breaker immediately
       await expect(resilienceEngine.execute("test-cb-trigger", fn, undefined, config)).rejects.toThrow("Circuit breaker is OPEN");
+    });
+  });
+
+  describe("Issue #855: adapter capability advertisement invalidation", () => {
+    it("advertises the configured capabilities with a revision stamp", () => {
+      const adapter = new EquilibreAdapter();
+
+      const advertisement = adapter.getCapabilityAdvertisement();
+
+      expect(advertisement.revision).toBe(adapter.getCapabilityRevision());
+      expect(advertisement.configFingerprint).toEqual(expect.any(String));
+      expect(advertisement.capabilities).toEqual(adapter.getConfig().capabilities);
+      expect(adapter.hasCapability("swap")).toBe(advertisement.capabilities.swap);
+      expect(adapter.hasValidCapabilityAdvertisement()).toBe(true);
+    });
+
+    it("invalidates the previous advertisement when the adapter configuration changes", () => {
+      const adapter = new EquilibreAdapter();
+      const before = adapter.getCapabilityAdvertisement();
+      const invalidations: Array<{
+        reason: string;
+        previousRevision: number | null;
+        revision: number;
+      }> = [];
+
+      adapter.onCapabilitiesInvalidated((event) => {
+        invalidations.push({
+          reason: event.reason,
+          previousRevision: event.previous ? event.previous.revision : null,
+          revision: event.revision,
+        });
+      });
+
+      adapter.updateConfig({
+        capabilities: {
+          ...adapter.getConfig().capabilities,
+          swap: !before.capabilities.swap,
+        },
+      });
+
+      const after = adapter.getCapabilityAdvertisement();
+
+      expect(after.capabilities.swap).toBe(!before.capabilities.swap);
+      expect(adapter.hasCapability("swap")).toBe(!before.capabilities.swap);
+      expect(after.configFingerprint).not.toBe(before.configFingerprint);
+      expect(after.revision).toBe(before.revision + 1);
+      expect(invalidations).toEqual([
+        {
+          reason: "config-change",
+          previousRevision: before.revision,
+          revision: before.revision + 1,
+        },
+      ]);
+    });
+
+    it("detects a capability change made directly on the config object", () => {
+      const adapter = new EquilibreAdapter();
+      const before = adapter.getCapabilityAdvertisement();
+      const config = adapter.getConfig();
+
+      config.capabilities.lending = !before.capabilities.lending;
+
+      const after = adapter.getCapabilityAdvertisement();
+
+      expect(after.capabilities.lending).toBe(!before.capabilities.lending);
+      expect(after.configFingerprint).not.toBe(before.configFingerprint);
+      expect(after.revision).toBe(before.revision + 1);
+    });
+
+    it("drops the live advertisement on an explicit invalidation and re-advertises on next read", () => {
+      const adapter = new EquilibreAdapter();
+      adapter.getCapabilityAdvertisement();
+      const revision = adapter.getCapabilityRevision();
+
+      const event = adapter.invalidateCapabilities("manual");
+
+      expect(event.reason).toBe("manual");
+      expect(event.revision).toBe(revision + 1);
+      expect(adapter.getCapabilityRevision()).toBe(revision + 1);
+      expect(adapter.hasValidCapabilityAdvertisement()).toBe(false);
+
+      // Reading a capability derives a fresh advertisement for the current config.
+      expect(adapter.hasCapability("swap")).toBe(adapter.getConfig().capabilities.swap);
+      expect(adapter.hasValidCapabilityAdvertisement()).toBe(true);
+      expect(adapter.getCapabilityRevision()).toBe(revision + 1);
+    });
+
+    it("replaces the whole configuration through applyConfig and keeps the advertisement in sync", () => {
+      const adapter = new EquilibreAdapter();
+      const before = adapter.getCapabilityAdvertisement();
+      const replacement = {
+        ...adapter.getConfig(),
+        apiUrl: "https://api.equilibre.example",
+        capabilities: {
+          ...adapter.getConfig().capabilities,
+          swap: true,
+          liquidity: false,
+        },
+      };
+
+      adapter.applyConfig(replacement);
+
+      const after = adapter.getCapabilityAdvertisement();
+
+      expect(adapter.getConfig().apiUrl).toBe("https://api.equilibre.example");
+      expect(after.capabilities).toEqual(replacement.capabilities);
+      expect(adapter.hasCapability("liquidity")).toBe(false);
+      expect(after.configFingerprint).not.toBe(before.configFingerprint);
+      expect(after.revision).toBe(before.revision + 1);
     });
   });
 });

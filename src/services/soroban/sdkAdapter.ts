@@ -90,11 +90,37 @@ export interface SimulationFailure {
   error: string;
 }
 
-export function isSimulationError(sim: unknown): sim is SimulationFailure {
+/**
+ * A simulation that succeeded only because the node assumed the required
+ * ledger entries were present. The accompanying `restorePreamble` describes
+ * the transaction that must be submitted first to actually restore them.
+ */
+export interface SimulationRestore {
+  restorePreamble: {
+    minResourceFee?: string;
+    transactionData?: unknown;
+  };
+}
+
+/**
+ * Resolve the SDK's `Api` namespace.
+ *
+ * The installed SDK exposes it as `rpc.Api`; older layouts used
+ * `SorobanRpc.Api`. Both are checked so the type guards below can delegate to
+ * the SDK rather than relying only on duck-typing.
+ */
+function resolveApiNamespace(): Record<string, unknown> | undefined {
   const sdk = StellarSdk as unknown as Record<string, unknown>;
-  const api = (sdk["SorobanRpc"] as Record<string, unknown> | undefined)?.[
-    "Api"
-  ] as Record<string, unknown> | undefined;
+  for (const nsName of ["SorobanRpc", "rpc"]) {
+    const ns = sdk[nsName] as Record<string, unknown> | undefined;
+    const api = ns?.["Api"] as Record<string, unknown> | undefined;
+    if (api) return api;
+  }
+  return undefined;
+}
+
+export function isSimulationError(sim: unknown): sim is SimulationFailure {
+  const api = resolveApiNamespace();
 
   if (api?.["isSimulationError"]) {
     return (api["isSimulationError"] as (s: unknown) => boolean)(sim);
@@ -104,10 +130,7 @@ export function isSimulationError(sim: unknown): sim is SimulationFailure {
 }
 
 export function isSimulationSuccess(sim: unknown): sim is SimulationSuccess {
-  const sdk = StellarSdk as unknown as Record<string, unknown>;
-  const api = (sdk["SorobanRpc"] as Record<string, unknown> | undefined)?.[
-    "Api"
-  ] as Record<string, unknown> | undefined;
+  const api = resolveApiNamespace();
 
   if (api?.["isSimulationSuccess"]) {
     return (api["isSimulationSuccess"] as (s: unknown) => boolean)(sim);
@@ -117,6 +140,47 @@ export function isSimulationSuccess(sim: unknown): sim is SimulationSuccess {
   return (
     !s?.["error"] &&
     (s?.["result"] !== undefined || s?.["minResourceFee"] !== undefined)
+  );
+}
+
+/**
+ * Return true when the simulation succeeded but its footprint includes ledger
+ * entries that have expired and must be restored before the real transaction
+ * can be submitted.
+ *
+ * This is neither an error nor a plain success: the RPC executed the call "as
+ * if" the entries existed. Callers that ignore it will assemble and submit a
+ * transaction the network will reject, so it is surfaced as its own outcome
+ * rather than folded into the success or error path.
+ */
+export function isSimulationRestore(
+  sim: unknown
+): sim is SimulationRestore & SimulationSuccess {
+  const api = resolveApiNamespace();
+
+  if (api?.["isSimulationRestore"]) {
+    // The SDK's guard dereferences `restorePreamble.transactionData` without
+    // a null check and throws on a malformed response. Route a null preamble
+    // to the local check rather than propagating that TypeError.
+    const preamble = (sim as Record<string, unknown> | undefined)?.[
+      "restorePreamble"
+    ];
+    if (preamble === null || preamble === undefined) return false;
+    return (api["isSimulationRestore"] as (s: unknown) => boolean)(sim);
+  }
+  // Fallback: duck-type, mirroring the SDK's own guard — a success that
+  // carries a preamble with its own transactionData. Requiring the preamble's
+  // transactionData matters: a response with a preamble but no restore
+  // payload carries nothing actionable and is not a restore case.
+  const s = sim as Record<string, unknown>;
+  const preamble = s?.["restorePreamble"] as
+    | Record<string, unknown>
+    | undefined;
+  return (
+    isSimulationSuccess(sim) &&
+    !!preamble &&
+    typeof preamble === "object" &&
+    !!preamble["transactionData"]
   );
 }
 

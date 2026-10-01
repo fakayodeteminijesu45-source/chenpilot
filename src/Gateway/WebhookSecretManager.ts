@@ -1,4 +1,4 @@
-import { logger } from "../Shared/logger";
+import { logger } from "../config/logger";
 
 /**
  * Secret configuration for a webhook provider

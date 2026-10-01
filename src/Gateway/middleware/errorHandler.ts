@@ -21,6 +21,8 @@ import { ApiErrorCode, isApiError } from "../../contracts/errorContract";
  * a separate `instanceof ApplicationError` branch is `unreachable` — one
  * `isApiError` check covers both.
  */
+import { isBudgetExhaustedError } from "../../utils/budget";
+
 export async function ErrorHandler(
   err: unknown,
   req: Request,
@@ -28,6 +30,54 @@ export async function ErrorHandler(
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   next: NextFunction
 ): Promise<void> {
+  // Budget exhaustion (e.g. byte limits on inbound requests)
+  if (isBudgetExhaustedError(err)) {
+    logger.warn("Request budget exhausted", {
+      resource: err.resource,
+      path: req.originalUrl,
+      message: err.message,
+    });
+    res.status(413).json({
+      success: false,
+      status: 413,
+      error: {
+        message: err.message,
+        code: "BUDGET_EXHAUSTED",
+        details: {
+          resource: err.resource,
+          budget: {
+            path: err.budget.path,
+            bytes: err.budget.bytes,
+            consumedBytes: err.budget.consumedBytes,
+          },
+        },
+      },
+    });
+    return;
+  }
+
+  // Body-parser entity.too.large (413 Payload Too Large)
+  const anyErr = err as Record<string, unknown> | null;
+  if (
+    anyErr?.type === "entity.too.large" ||
+    anyErr?.status === 413 ||
+    anyErr?.statusCode === 413
+  ) {
+    logger.warn("Payload too large", {
+      path: req.originalUrl,
+      message: (anyErr?.message as string) || "Payload too large",
+    });
+    res.status(413).json({
+      success: false,
+      status: 413,
+      error: {
+        message: (anyErr?.message as string) || "Payload too large",
+        code: "PAYLOAD_TOO_LARGE",
+      },
+    });
+    return;
+  }
+
   // 1) Platform contract — preferred path (covers legacy subclasses too)
   if (isApiError(err)) {
     const includeStack = process.env.NODE_ENV !== "production";
@@ -103,7 +153,7 @@ export async function ErrorHandler(
     message: pgish?.message || "No message provided",
     statusCode,
     errorCode,
-    category,
+    category: (pgish as any)?.category,
     method: req.method,
     url: req.originalUrl,
     stack: pgish?.stack,

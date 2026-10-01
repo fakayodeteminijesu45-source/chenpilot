@@ -10,6 +10,7 @@ import {
   DeliveryPlatform,
   DeliveryStatus,
 } from '../core.js';
+import { splitNotificationContent, PLATFORM_LIMITS } from '../messageSplitter.js';
 
 /**
  * Telegram notification handler
@@ -43,15 +44,20 @@ export class TelegramNotificationHandler implements PlatformDeliveryHandler {
         throw new Error('Telegram adapter not available');
       }
 
-      // Send notification via Telegram adapter
-      // This assumes the adapter has a sendNotification method
-      if (typeof this.telegramAdapter.sendNotification === 'function') {
-        await this.telegramAdapter.sendNotification(message.userId, message.content);
-      } else if (typeof this.telegramAdapter.sendMessage === 'function') {
-        // Alternative method name
-        await this.telegramAdapter.sendMessage(message.userId, message.content);
-      } else {
+      // Split oversized content before sending; critical facts are validated internally.
+      const { chunks } = splitNotificationContent(message, PLATFORM_LIMITS.telegram);
+      const send = typeof this.telegramAdapter.sendNotification === 'function'
+        ? (text: string) => this.telegramAdapter.sendNotification(message.userId, text)
+        : typeof this.telegramAdapter.sendMessage === 'function'
+          ? (text: string) => this.telegramAdapter.sendMessage(message.userId, text)
+          : null;
+
+      if (!send) {
         throw new Error('Telegram adapter does not have sendNotification method');
+      }
+
+      for (const chunk of chunks) {
+        await send(chunk);
       }
 
       this.latency = Date.now() - startTime;

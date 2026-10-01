@@ -10,6 +10,7 @@ import {
   DeliveryPlatform,
   DeliveryStatus,
 } from '../core.js';
+import { splitNotificationContent, PLATFORM_LIMITS } from '../messageSplitter.js';
 
 /**
  * Discord notification handler
@@ -43,15 +44,21 @@ export class DiscordNotificationHandler implements PlatformDeliveryHandler {
         throw new Error('Discord adapter not available');
       }
 
-      // Send notification via Discord adapter
-      // This assumes the adapter has a sendNotification method
-      if (typeof this.discordAdapter.sendNotification === 'function') {
-        await this.discordAdapter.sendNotification(message.userId, message.content, message.embed);
-      } else if (typeof this.discordAdapter.sendMessage === 'function') {
-        // Alternative method name
-        await this.discordAdapter.sendMessage(message.userId, message.content, message.embed);
-      } else {
+      // Split oversized content before sending; critical facts are validated internally.
+      const { chunks } = splitNotificationContent(message, PLATFORM_LIMITS.discord);
+      const send = typeof this.discordAdapter.sendNotification === 'function'
+        ? (text: string, embed: unknown) => this.discordAdapter.sendNotification(message.userId, text, embed)
+        : typeof this.discordAdapter.sendMessage === 'function'
+          ? (text: string, embed: unknown) => this.discordAdapter.sendMessage(message.userId, text, embed)
+          : null;
+
+      if (!send) {
         throw new Error('Discord adapter does not have sendNotification method');
+      }
+
+      // Only attach the embed to the first chunk; subsequent chunks are plain text continuations.
+      for (let i = 0; i < chunks.length; i++) {
+        await send(chunks[i], i === 0 ? message.embed : undefined);
       }
 
       this.latency = Date.now() - startTime;

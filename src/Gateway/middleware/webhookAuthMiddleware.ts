@@ -1,9 +1,9 @@
 import { Request, Response, NextFunction } from "express";
 import { webhookSignatureService } from "../WebhookSignatureService";
 import { webhookReplayTracker } from "../WebhookReplayTracker";
-import { logger } from "../../Shared/logger";
-import { auditLogService, AuditEventAction } from "../../Audit/auditLog.service";
-import { AuditEventSeverity, EventCategory } from "../../Audit/auditLog.types";
+import { logger } from "../../config/logger";
+import { auditLogService, AuditEventAction } from "../../AuditLog/auditLog.service";
+import { AuditEventSeverity, EventCategory } from "../../AuditLog/auditEvent.types";
 
 /**
  * Extract webhook ID from request body (provider-specific)

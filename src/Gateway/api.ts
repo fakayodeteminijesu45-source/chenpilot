@@ -26,6 +26,8 @@ import { ErrorHandler } from "./middleware/errorHandler";
 import { UnauthorizedError, ValidationError, BadError } from "../utils/error";
 import { healthService } from "../services/healthService";
 import { rawBodyCapture } from "./middleware/rawBodyCapture.middleware";
+import { inboundPolicyMiddleware } from "./middleware/inboundPolicy.middleware";
+import config from "../config/config";
 
 declare module "express" {
   interface Request {
@@ -55,10 +57,21 @@ app.use(
   })
 );
 
+// Inbound size policy enforcement (JSON, webhook, attachment, and endpoint gaps)
+// Early-rejects oversized requests and tracks exhaustion in BudgetManager
+app.use(inboundPolicyMiddleware);
+
 // CRITICAL: Raw body capture MUST come before express.json()
 // This preserves original request bytes for webhook signature verification
 app.use(rawBodyCapture);
-app.use(express.json());
+
+// Express JSON parsing configured with max attachment limit so endpoint-specific gaps
+// and large attachments can be parsed, with tight limits enforced by inboundPolicyMiddleware
+app.use(
+  express.json({
+    limit: config.inbound?.attachmentLimit || "25mb",
+  })
+);
 app.use(observabilityMiddleware);
 app.use(requestLogger);
 app.use(ipBlacklistMiddleware);
